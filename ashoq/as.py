@@ -7,11 +7,10 @@ import threading
 import queue
 import speech_recognition as sr
 import pyttsx3
-import time
 
 app = Flask(__name__)
 
-# Initialize YOLOS-Tiny model (fast object detection)
+# YOLOS-Tiny setup
 model_name = "hustvl/yolos-tiny"
 processor = YolosImageProcessor.from_pretrained(model_name)
 model = YolosForObjectDetection.from_pretrained(model_name)
@@ -23,16 +22,8 @@ recognizer = sr.Recognizer()
 mic = sr.Microphone()
 engine = pyttsx3.init()
 engine.setProperty('rate', 150)
-
-# Webcam setup
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-
-# Queue for voice commands
 command_queue = queue.Queue()
 
-# Voice recognition thread
 def listen_for_commands(command_queue):
     with mic as source:
         recognizer.adjust_for_ambient_noise(source, duration=1)
@@ -48,10 +39,24 @@ def listen_for_commands(command_queue):
             except sr.RequestError as e:
                 print(f"Voice recognition error: {e}")
 
-# Image analysis function
+voice_thread = threading.Thread(target=listen_for_commands, args=(command_queue,), daemon=True)
+voice_thread.start()
+
+# EC2 webcam workaround
+cap = None
+try:
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise Exception("No webcam")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+except:
+    print("No webcam available, using placeholder.")
+
+# Image analysis
 def analyze_image(frame):
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    pil_image = rgb_frame  # YOLOS accepts numpy arrays directly
+    pil_image = rgb_frame
     inputs = processor(images=pil_image, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model(**inputs)
@@ -64,20 +69,19 @@ def analyze_image(frame):
     engine.runAndWait()
     return label, response
 
-# Start voice thread
-voice_thread = threading.Thread(target=listen_for_commands, args=(command_queue,), daemon=True)
-voice_thread.start()
-
-# Camera feed generator
+# Camera feed
 def generate_frames():
-    while True:
+    if cap is None:
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        cv2.putText(frame, "No Camera on EC2", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    else:
         ret, frame = cap.read()
         if not ret:
-            break
-        ret, buffer = cv2.imencode('.jpg', frame)
-        frame = buffer.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    ret, buffer = cv2.imencode('.jpg', frame)
+    frame = buffer.tobytes()
+    yield (b'--frame\r\n'
+           b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
 # Routes
 @app.route('/')
@@ -157,9 +161,7 @@ def index():
             <h3>AI Response:</h3>
             <p id="response-text">Waiting for response...</p>
         </div>
-
         <script>
-            // Capture button
             document.getElementById('capture-btn').addEventListener('click', function() {
                 fetch('/capture', { method: 'POST' })
                     .then(response => response.json())
@@ -172,8 +174,6 @@ def index():
                         }
                     });
             });
-
-            // Voice command polling
             function checkVoiceCommand() {
                 fetch('/voice_command')
                     .then(response => response.json())
@@ -185,7 +185,7 @@ def index():
                             alert('Quitting... Please close the tab.');
                         }
                     });
-                setTimeout(checkVoiceCommand, 1000);  // Poll every second
+                setTimeout(checkVoiceCommand, 1000);
             }
             checkVoiceCommand();
         </script>
@@ -200,7 +200,7 @@ def video_feed():
 
 @app.route('/capture', methods=['POST'])
 def capture():
-    ret, frame = cap.read()
+    ret, frame = cap.read() if cap else (True, np.zeros((240, 320, 3), dtype=np.uint8))
     if not ret:
         return jsonify({'error': 'Failed to capture image'})
     description, response = analyze_image(frame)
@@ -213,7 +213,7 @@ def voice_command():
         if "quit" in command:
             return jsonify({'command': 'quit'})
         elif "capture" in command:
-            ret, frame = cap.read()
+            ret, frame = cap.read() if cap else (True, np.zeros((240, 320, 3), dtype=np.uint8))
             if ret:
                 description, response = analyze_image(frame)
                 return jsonify({'command': 'capture', 'description': description, 'response': response})
@@ -223,6 +223,7 @@ def voice_command():
 
 if __name__ == '__main__':
     try:
-        app.run(debug=True, threaded=True)
+        app.run(debug=True, threaded=True, host='0.0.0.0', port=5000)
     finally:
-        cap.release()
+        if cap:
+            cap.release()
