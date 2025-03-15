@@ -7,6 +7,7 @@ import threading
 import queue
 import speech_recognition as sr
 import pyttsx3
+import os
 
 app = Flask(__name__)
 
@@ -19,57 +20,46 @@ model.to(device)
 
 # Voice setup
 recognizer = sr.Recognizer()
-mic = sr.Microphone()
 engine = pyttsx3.init()
+
+# Ensure espeak is used for AWS EC2
 engine.setProperty('rate', 150)
+engine.setProperty('voice', 'english')
+engine.setProperty('volume', 1.0)
+
 command_queue = queue.Queue()
 
-def listen_for_commands(command_queue):
-    with mic as source:
-        recognizer.adjust_for_ambient_noise(source, duration=1)
-        print("Voice recognition started. Say 'capture' or 'quit'.")
-        while True:
-            try:
-                audio = recognizer.listen(source, timeout=None)
-                command = recognizer.recognize_google(audio).lower()
-                print(f"You said: {command}")
-                command_queue.put(command)
-            except sr.UnknownValueError:
-                pass
-            except sr.RequestError as e:
-                print(f"Voice recognition error: {e}")
-
-voice_thread = threading.Thread(target=listen_for_commands, args=(command_queue,), daemon=True)
-voice_thread.start()
-
-# EC2 webcam workaround
+# 🔹 Check for a real webcam (EC2 won't have one)
 cap = None
 try:
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        raise Exception("No webcam")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+        raise Exception("No webcam detected")
 except:
-    print("No webcam available, using placeholder.")
+    print("❌ No webcam available. Using placeholder.")
 
-# Image analysis
+# 🔹 Function to analyze image using YOLOS model
 def analyze_image(frame):
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    pil_image = rgb_frame
-    inputs = processor(images=pil_image, return_tensors="pt").to(device)
+    inputs = processor(images=rgb_frame, return_tensors="pt").to(device)
+
     with torch.no_grad():
         outputs = model(**inputs)
+
     scores = outputs.logits.softmax(-1)[0]
     max_score_idx = scores.max(dim=0).indices[-1]
     confidence = scores.max(dim=0).values[-1].item()
+    
     label = model.config.id2label[max_score_idx.item()] if confidence > 0.5 else "Nothing detected"
     response = f"I see: {label}"
+
+    # 🔹 Text-to-Speech
     engine.say(response)
     engine.runAndWait()
+
     return label, response
 
-# Camera feed
+# 🔹 Function to generate a camera feed (EC2 uses a placeholder)
 def generate_frames():
     if cap is None:
         frame = np.zeros((240, 320, 3), dtype=np.uint8)
@@ -78,12 +68,25 @@ def generate_frames():
         ret, frame = cap.read()
         if not ret:
             frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    
     ret, buffer = cv2.imencode('.jpg', frame)
     frame = buffer.tobytes()
+    
     yield (b'--frame\r\n'
            b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
-# Routes
+# 🔹 Function to process voice commands from a file (EC2 workaround)
+def process_audio_file(audio_file):
+    try:
+        with sr.AudioFile(audio_file) as source:
+            audio = recognizer.record(source)
+        return recognizer.recognize_google(audio).lower()
+    except sr.UnknownValueError:
+        return "Could not understand audio"
+    except sr.RequestError as e:
+        return f"Error: {e}"
+
+# 🔹 Routes
 @app.route('/')
 def index():
     html = '''
@@ -91,70 +94,15 @@ def index():
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>Fast Camera AI</title>
-        <style>
-            body {
-                font-family: 'Segoe UI', sans-serif;
-                background: linear-gradient(135deg, #74ebd5, #acb6e5);
-                margin: 0;
-                padding: 20px;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                min-height: 100vh;
-            }
-            h1 {
-                color: #fff;
-                text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
-                font-size: 2.5em;
-                margin-bottom: 20px;
-            }
-            #video-feed {
-                width: 320px;
-                height: 240px;
-                border-radius: 15px;
-                box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
-                margin-bottom: 20px;
-            }
-            button {
-                background-color: #ff6f61;
-                color: white;
-                border: none;
-                padding: 12px 25px;
-                font-size: 1.2em;
-                border-radius: 25px;
-                cursor: pointer;
-                transition: transform 0.2s, background-color 0.2s;
-                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            }
-            button:hover {
-                background-color: #ff4d3d;
-                transform: scale(1.05);
-            }
-            #response {
-                background: rgba(255, 255, 255, 0.9);
-                padding: 20px;
-                border-radius: 15px;
-                box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-                max-width: 400px;
-                text-align: left;
-            }
-            h3 {
-                color: #333;
-                margin: 10px 0 5px;
-            }
-            p {
-                color: #555;
-                margin: 5px 0;
-                font-size: 1.1em;
-            }
-        </style>
+        <title>Camera AI Assistant</title>
     </head>
     <body>
         <h1>Camera AI Assistant</h1>
         <img src="{{ url_for('video_feed') }}" id="video-feed" alt="Live Feed">
         <button id="capture-btn">Capture & Analyze</button>
-        <p>Say "capture" to analyze or "quit" to stop.</p>
+        <p>Upload an audio file for voice commands.</p>
+        <input type="file" id="audio-input" accept="audio/wav">
+        <button id="process-audio-btn">Process Audio</button>
         <div id="response">
             <h3>AI Description:</h3>
             <p id="description">Waiting for capture...</p>
@@ -174,20 +122,22 @@ def index():
                         }
                     });
             });
-            function checkVoiceCommand() {
-                fetch('/voice_command')
+
+            document.getElementById('process-audio-btn').addEventListener('click', function() {
+                var fileInput = document.getElementById('audio-input').files[0];
+                if (!fileInput) {
+                    alert("Please select an audio file.");
+                    return;
+                }
+                var formData = new FormData();
+                formData.append('file', fileInput);
+
+                fetch('/process_audio', { method: 'POST', body: formData })
                     .then(response => response.json())
                     .then(data => {
-                        if (data.command === 'capture') {
-                            document.getElementById('description').textContent = data.description;
-                            document.getElementById('response-text').textContent = data.response;
-                        } else if (data.command === 'quit') {
-                            alert('Quitting... Please close the tab.');
-                        }
+                        alert("Command: " + data.command);
                     });
-                setTimeout(checkVoiceCommand, 1000);
-            }
-            checkVoiceCommand();
+            });
         </script>
     </body>
     </html>
@@ -203,24 +153,25 @@ def capture():
     ret, frame = cap.read() if cap else (True, np.zeros((240, 320, 3), dtype=np.uint8))
     if not ret:
         return jsonify({'error': 'Failed to capture image'})
+    
     description, response = analyze_image(frame)
     return jsonify({'description': description, 'response': response})
 
-@app.route('/voice_command', methods=['GET'])
-def voice_command():
-    try:
-        command = command_queue.get_nowait()
-        if "quit" in command:
-            return jsonify({'command': 'quit'})
-        elif "capture" in command:
-            ret, frame = cap.read() if cap else (True, np.zeros((240, 320, 3), dtype=np.uint8))
-            if ret:
-                description, response = analyze_image(frame)
-                return jsonify({'command': 'capture', 'description': description, 'response': response})
-        return jsonify({'command': None})
-    except queue.Empty:
-        return jsonify({'command': None})
+@app.route('/process_audio', methods=['POST'])
+def process_audio():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'})
 
+    file = request.files['file']
+    file_path = "temp_audio.wav"
+    file.save(file_path)
+
+    command = process_audio_file(file_path)
+    os.remove(file_path)  # Clean up the file after processing
+
+    return jsonify({'command': command})
+
+# 🔹 Run Flask app
 if __name__ == '__main__':
     try:
         app.run(debug=True, threaded=True, host='0.0.0.0', port=5000)
